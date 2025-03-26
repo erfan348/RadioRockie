@@ -1,0 +1,134 @@
+# قبل از اجرا این دستور رو در ترمینال بزن تا Telethon، librosa، spotipy و flask نصب شه:
+# pip install telethon librosa numpy spotipy flask
+
+from telethon import TelegramClient
+import os
+import re
+import librosa
+import numpy as np
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+import json
+from flask import Flask, jsonify, send_from_directory, render_template_string
+
+# --------- مرحله ۱: تنظیمات API تلگرام ---------
+api_id = '26973577'
+api_hash = 'bf3596c4fbf3689f2df5d6c2c2428a4a'
+channel_username = 'RadioRockie'
+
+# --------- تنظیمات API اسپاتیفای ---------
+sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
+    client_id='YOUR_SPOTIFY_CLIENT_ID',
+    client_secret='YOUR_SPOTIFY_CLIENT_SECRET'
+))
+
+# مسیر ذخیره فایل‌ها
+save_path = 'downloaded_music'
+os.makedirs(save_path, exist_ok=True)
+
+# تابعی برای پاکسازی کاراکترهای غیرمجاز در نام فایل
+def clean_filename(filename):
+    return re.sub(r'[<>:"/\\|?*]', '', filename)
+
+# تابع محاسبه تمپو و انرژی فایل صوتی
+def analyze_audio(file_path):
+    y, sr = librosa.load(file_path)
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+    energy = np.mean(y ** 2)
+    return tempo, energy
+
+# تابع پیدا کردن ترک در اسپاتیفای و گرفتن ویژگی‌های آن
+def get_spotify_info(track_name):
+    results = sp.search(q=track_name, type='track', limit=1)
+    if results['tracks']['items']:
+        track = results['tracks']['items'][0]
+        track_id = track['id']
+        audio_features = sp.audio_features(track_id)[0]
+        return {
+            'tempo': audio_features['tempo'],
+            'energy': audio_features['energy'],
+            'danceability': audio_features['danceability'],
+            'crossfade_recommendation': round(max(1, min(10, (audio_features['tempo'] / 20) + (audio_features['danceability'] * 5))))
+        }
+    return None
+
+# --------- اتصال به تلگرام ---------
+client = TelegramClient('music_downloader_session', api_id, api_hash)
+
+async def download_music():
+    await client.start()
+    report = []
+    async for msg in client.iter_messages(channel_username):
+        if msg.file and msg.file.mime_type and 'audio' in msg.file.mime_type:
+            file_name = msg.file.name or f'{msg.id}.mp3'
+            file_name = clean_filename(file_name)
+            full_path = os.path.join(save_path, file_name)
+            print(f'Downloading: {file_name}')
+            await msg.download_media(file=full_path)
+
+            local_tempo, local_energy = analyze_audio(full_path)
+            spotify_info = get_spotify_info(file_name.replace('.mp3', ''))
+
+            track_data = {
+                'file_name': file_name,
+                'local_tempo': local_tempo,
+                'local_energy': local_energy,
+                'spotify_info': spotify_info or {}
+            }
+
+            if spotify_info:
+                print(f'✔ {file_name} | Local Tempo: {local_tempo:.2f} BPM | Spotify Tempo: {spotify_info["tempo"]} BPM | Energy: {spotify_info["energy"]:.2f} | Danceability: {spotify_info["danceability"]:.2f} | Suggested crossfade: {spotify_info["crossfade_recommendation"]}s')
+            else:
+                print(f'✔ {file_name} | Local Tempo: {local_tempo:.2f} BPM | Energy: {local_energy:.4f} | No Spotify data found')
+
+            report.append(track_data)
+
+    with open('music_analysis_report.json', 'w') as f:
+        json.dump(report, f, indent=4)
+
+    print('✅ All music files downloaded, analyzed, and report saved.')
+
+# --------- سرور فلَسک برای نمایش و استریم موزیک‌ها ---------
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    with open('music_analysis_report.json', 'r') as f:
+        tracks = json.load(f)
+
+    html = """
+    <html><head><title>My DJ Station 🎧</title></head><body>
+    <h1>🎵 Music List</h1>
+    <p>Best VPS recommendation: Buy a Linux VPS with at least 2 CPU cores, 4GB RAM, 40GB SSD, Ubuntu 22.04 or Debian 12 installed. Providers like Hetzner, Contabo, or Vultr are great for price/performance.</p>
+    {% for track in tracks %}
+    <div style='margin-bottom:30px;'>
+        <h3>{{ track.file_name }}</h3>
+        <p>Local Tempo: {{ track.local_tempo }} BPM</p>
+        <p>Energy: {{ track.local_energy }}</p>
+        {% if track.spotify_info %}
+            <p>Spotify Tempo: {{ track.spotify_info.tempo }} | Energy: {{ track.spotify_info.energy }} | Danceability: {{ track.spotify_info.danceability }}</p>
+            <p>Suggested Crossfade: {{ track.spotify_info.crossfade_recommendation }} seconds</p>
+        {% endif %}
+        <audio controls>
+            <source src="/stream/{{ track.file_name }}" type="audio/mpeg">
+        </audio>
+    </div>
+    {% endfor %}
+    </body></html>
+    """
+    return render_template_string(html, tracks=tracks)
+
+@app.route('/stream/<filename>')
+def stream(filename):
+    return send_from_directory(save_path, filename)
+
+if __name__ == "__main__":
+    import asyncio
+    import threading
+
+    def start_download():
+        asyncio.run(download_music())
+
+    threading.Thread(target=start_download).start()
+
+    app.run(debug=True, port=5000)
